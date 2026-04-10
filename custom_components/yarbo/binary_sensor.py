@@ -1,4 +1,4 @@
-"""Binary sensor platform for Yarbo integration — configuration-driven."""
+"""Binary sensor platform for Yarbo integration — configuration-driven + Online."""
 
 from __future__ import annotations
 
@@ -28,6 +28,10 @@ async def async_setup_entry(
 
     entities: list[BinarySensorEntity] = []
     for device in coordinator.devices:
+        # Hardcoded Online binary sensor (heartbeat-driven)
+        entities.append(YarboOnlineBinarySensor(coordinator, device))
+
+        # Config-driven binary sensors from JSON field definitions
         field_defs = await hass.async_add_executor_job(
             get_field_definitions, device.type_id
         )
@@ -38,6 +42,37 @@ async def async_setup_entry(
                 )
 
     async_add_entities(entities)
+
+
+class YarboOnlineBinarySensor(
+    CoordinatorEntity[YarboDataUpdateCoordinator], BinarySensorEntity
+):
+    """Online status binary sensor driven by heartbeat timeout."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Online"
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+
+    def __init__(self, coordinator, device) -> None:
+        super().__init__(coordinator)
+        self._device = device
+        self._attr_unique_id = f"{device.sn}_online"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._device.sn)},
+            name=self._device.name,
+            manufacturer="Yarbo",
+            model=self._device.model,
+            serial_number=self._device.sn,
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        if self.coordinator.data and self._device.sn in self.coordinator.data:
+            return self.coordinator.data[self._device.sn].get("__online__")
+        return None
 
 
 class YarboConfigBinarySensor(
@@ -83,6 +118,17 @@ class YarboConfigBinarySensor(
         raw = self._extract(self._field_def.path)
         if raw is None:
             return None
+        # Custom extractor logic
+        if self._field_def.custom_extractor == "charging_threshold":
+            # BatteryMSG.status: >1 means charging
+            if isinstance(raw, (int, float)):
+                return raw > 1
+            return None
+        if self._field_def.custom_extractor == "positive_threshold":
+            # Value > 0 means on (e.g. LedInfoMSG.led_head: 255=on, 0=off)
+            if isinstance(raw, (int, float)):
+                return raw > 0
+            return None
         if self._field_def.value_map:
             mapped = self._field_def.value_map.get(str(raw))
             if mapped is None:
@@ -91,16 +137,11 @@ class YarboConfigBinarySensor(
         return bool(raw)
 
     def _extract(self, field_path: str):
-        """Extract a field value — supports __device__ prefix and MQTT data."""
-        if field_path.startswith("__device__."):
-            attr = field_path.split(".", 1)[1]
-            return getattr(self._device, attr, None)
-
+        """Extract a field value from coordinator data."""
         data = self._get_device_data()
         if data is None:
             return None
         from yarbo_robot_sdk.device_helpers import extract_field
-
         return extract_field(data, field_path)
 
     def _get_device_data(self) -> dict | None:

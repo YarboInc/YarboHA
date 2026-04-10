@@ -19,6 +19,54 @@ from .coordinator import YarboDataUpdateCoordinator
 # Sensor device_classes that represent a numeric measurement
 MEASUREMENT_CLASSES = {"battery", "temperature", "humidity", "distance", "pressure"}
 
+# on_going_planning status code → display text
+PLANNING_STATUS_MAP: dict[int, str] = {
+    0: "Not Started",
+    1: "Cleaning",
+    2: "Calculating Route",
+    3: "Heading to Area",
+    5: "Completed",
+    11: "Waypoint Navigation",
+    12: "Waypoint Complete",
+    -2: "Error: Create Plan History Failed (WP002)",
+    -10: "Error: Plan Not Found (WP003)",
+    -11: "Error: Failed to Read Plan (WP004)",
+    -12: "Error: Failed to Calculate Route (WP005)",
+    -20: "Error: Outside Mapped Area (WP006)",
+    -21: "Error: Area Data Error (WP007)",
+    -22: "Error: Route Data Error (WP008)",
+    -23: "Error: In No-Go Zone",
+    -24: "Error: Low Battery",
+    -26: "Error: Module Position Failure (WP012)",
+    -30: "Error: Location Data Exception (WP013)",
+    -31: "Error: Docking Station Exception (WP014)",
+    -40: "Error: Obstacle Mark Failed",
+    -42: "Error: Out of Boundary",
+    -43: "Error: Unable to Navigate Obstacle (WP016)",
+    -44: "Error: Exceeded Boundary (WP017)",
+    -47: "Error: Out of Boundary >1.5m",
+    -88: "Error: In No-Go Zone",
+    -92: "Error: Out of Boundary (WP025)",
+}
+
+# on_going_recharging status code → display text
+RECHARGING_STATUS_MAP: dict[int, str] = {
+    0: "Not Started",
+    1: "Returning on Path",
+    2: "Returning in Area",
+    3: "Repositioning",
+    4: "Charging",
+    99: "Verifying",
+    -2: "Error: Server Error",
+    -3: "Error: Direction Uninitialized",
+    -4: "Error: Docking Station Uninitialized",
+    -5: "Error: Recharge Failed (REC005)",
+    -6: "Error: Failed to Park",
+    -8: "Error: Docking Connection Failed",
+    -9: "Error: Stuck",
+    -20: "Error: Outside Mapped Area",
+}
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -38,6 +86,12 @@ async def async_setup_entry(
         for field_def in field_defs:
             if field_def.entity_type == "sensor":
                 entities.append(YarboConfigSensor(coordinator, device, field_def))
+
+    # Add map zone sensors
+    from .map_sensor import YarboMapSensor
+
+    for device in coordinator.devices:
+        entities.append(YarboMapSensor(coordinator, device))
 
     async_add_entities(entities)
 
@@ -95,24 +149,73 @@ class YarboConfigSensor(
 
     @property
     def native_value(self):
+        # Special extraction for custom_extractor fields (e.g. network_priority)
+        if self._field_def.custom_extractor:
+            return self._extract_custom()
         raw = self._extract(self._field_def.path)
         if raw is None:
             return None
         if self._field_def.value_map:
-            return self._field_def.value_map.get(str(raw), f"unknown_{raw}")
+            mapped = self._field_def.value_map.get(str(raw))
+            if mapped is not None:
+                return mapped
+            # For numeric values, check if a negative fallback exists (e.g. all negatives → "Error")
+            if isinstance(raw, (int, float)) and raw < 0:
+                return self._field_def.value_map.get("-1")
+            return None
         return raw
 
-    def _extract(self, field_path: str):
-        """Extract a field value — supports __device__ prefix and MQTT data."""
-        if field_path.startswith("__device__."):
-            attr = field_path.split(".", 1)[1]
-            return getattr(self._device, attr, None)
+    def _extract_custom(self):
+        """Handle fields with custom_extractor logic."""
+        data = self._get_device_data()
+        if data is None:
+            return None
+        if self._field_def.custom_extractor == "network_priority":
+            from yarbo_robot_sdk.device_helpers import extract_active_network, extract_field
+            route_priority = extract_field(data, self._field_def.path)
+            return extract_active_network(route_priority)
+        if self._field_def.custom_extractor == "volume_scale":
+            from yarbo_robot_sdk.device_helpers import extract_field
+            raw = extract_field(data, self._field_def.path)
+            if raw is None:
+                return None
+            return int(float(raw) * 100)
+        if self._field_def.custom_extractor == "rtk_signal":
+            from yarbo_robot_sdk.device_helpers import extract_field
+            raw = extract_field(data, self._field_def.path)
+            # APP logic: 4=Strong, 5=Medium, everything else=Weak
+            raw_int = int(raw) if raw is not None else None
+            if raw_int == 4:
+                return "Strong"
+            if raw_int == 5:
+                return "Medium"
+            return "Weak"
+        if self._field_def.custom_extractor == "planning_status":
+            from yarbo_robot_sdk.device_helpers import extract_field
+            raw = extract_field(data, self._field_def.path)
+            if raw is None:
+                return None
+            code = int(raw)
+            if code in PLANNING_STATUS_MAP:
+                return PLANNING_STATUS_MAP[code]
+            return "Error" if code < 0 else None
+        if self._field_def.custom_extractor == "recharging_status":
+            from yarbo_robot_sdk.device_helpers import extract_field
+            raw = extract_field(data, self._field_def.path)
+            if raw is None:
+                return None
+            code = int(raw)
+            if code in RECHARGING_STATUS_MAP:
+                return RECHARGING_STATUS_MAP[code]
+            return "Error" if code < 0 else None
+        return None
 
+    def _extract(self, field_path: str):
+        """Extract a field value from MQTT data."""
         data = self._get_device_data()
         if data is None:
             return None
         from yarbo_robot_sdk.device_helpers import extract_field
-
         return extract_field(data, field_path)
 
     def _get_device_data(self) -> dict | None:

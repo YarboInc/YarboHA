@@ -1,7 +1,7 @@
 """Constants for the Yarbo integration."""
 
 DOMAIN = "yarbo"
-PLATFORMS = ["sensor", "binary_sensor", "select"]
+PLATFORMS = ["sensor", "binary_sensor", "select", "device_tracker", "button", "switch", "number"]
 
 # Config flow
 CONF_EMAIL = "email"
@@ -10,5 +10,5 @@ CONF_PASSWORD = "password"
 DATA_ACCESS_TOKEN = "access_token"
 DATA_REFRESH_TOKEN = "refresh_token"
 
-# MQTT status update interval fallback (REST polling)
-UPDATE_INTERVAL_MINUTES = 5
+# Options
+CONF_SELECTED_DEVICES = "selected_devices"

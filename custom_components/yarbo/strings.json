@@ -9,6 +9,13 @@
           "password": "Password"
         }
       },
+      "select_devices": {
+        "title": "Select Devices",
+        "description": "Choose which Yarbo devices to add to Home Assistant.",
+        "data": {
+          "selected_devices": "Devices"
+        }
+      },
       "reauth_confirm": {
         "title": "Re-authenticate Yarbo",
         "description": "Your session has expired. Please enter your password again.",
@@ -19,11 +26,30 @@
     },
     "error": {
       "invalid_auth": "Invalid email or password.",
-      "cannot_connect": "Unable to connect to Yarbo service."
+      "cannot_connect": "Unable to connect to Yarbo service.",
+      "no_devices_selected": "Please select at least one device.",
+      "no_devices_found": "No devices found for this account.",
+      "fetch_devices_failed": "Failed to fetch device list. Please try again."
     },
     "abort": {
       "already_configured": "This account is already configured.",
       "reauth_successful": "Re-authentication successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Manage Devices",
+        "description": "Select which Yarbo devices to monitor in Home Assistant.",
+        "data": {
+          "selected_devices": "Devices"
+        }
+      }
+    },
+    "error": {
+      "no_devices_selected": "Please select at least one device.",
+      "no_devices_found": "No devices found for this account.",
+      "fetch_devices_failed": "Failed to fetch device list. Please try again."
     }
   }
 }

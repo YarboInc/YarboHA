@@ -117,6 +117,10 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         self.devices: list = []
         self._gps_refs: dict[str, dict] = {}
         self._map_data: dict[str, dict] = {}
+        # Raw zone data (with enable flags, names, range points, etc.)
+        # as returned by get_map. Persisted so entities can expose
+        # per-zone metadata without re-fetching.
+        self._map_raw: dict[str, dict] = {}
         self._plan_data: dict[str, list[dict]] = {}
         self._last_heartbeat: dict[str, float] = {}
         self._user_standby: dict[str, bool] = {}
@@ -470,6 +474,11 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
     # ---- Map data ----
 
     @property
+    def map_raw(self) -> dict[str, dict]:
+        """Raw get_map response per device (with enable flags, names, etc)."""
+        return self._map_raw
+
+    @property
     def map_data(self) -> dict[str, dict]:
         """Map zone data per device: {sn: GeoJSON FeatureCollection}."""
         return self._map_data
@@ -487,6 +496,7 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             fallback_ref = self._gps_refs.get(sn)
             geojson = convert_map_to_geojson(raw_data, fallback_ref)
             self._map_data[sn] = geojson
+            self._map_raw[sn] = raw_data
             feature_count = len(geojson.get("features", []))
             _LOGGER.info("Map data for %s: %d features loaded", sn, feature_count)
         except TimeoutError:

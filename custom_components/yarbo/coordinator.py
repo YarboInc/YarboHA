@@ -125,6 +125,12 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         self._last_heartbeat: dict[str, float] = {}
         self._user_standby: dict[str, bool] = {}
         self._selected_plan: dict[str, int | None] = {}
+        # Live plan state (projected path, actual_clean_area, areaIds)
+        # from the undocumented plan_feedback topic.
+        self._plan_feedback: dict[str, dict] = {}
+        # Dynamic obstacles (tmp_barrier_points) from the undocumented
+        # cloud_points_feedback topic.
+        self._cloud_points: dict[str, dict] = {}
         self._unsub_heartbeat_check: CALLBACK_TYPE | None = None
         self._unsub_wakeup_renewal: CALLBACK_TYPE | None = None
 
@@ -220,6 +226,61 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                     device.type_id,
                     None,
                 )
+                plan_topic = f"snowbot/{device.sn}/device/plan_feedback"
+
+                def _on_plan_feedback(topic_str, payload, _sn=device.sn):
+                    from yarbo_robot_sdk.codec import decode_mqtt_payload
+                    try:
+                        data = decode_mqtt_payload(payload)
+                    except Exception as err:
+                        _LOGGER.warning(
+                            "plan_feedback decode failed for %s: %s", _sn, err,
+                        )
+                        return
+                    if not isinstance(data, dict):
+                        return
+                    self._plan_feedback[_sn] = data
+                    if self.data is not None:
+                        self.hass.loop.call_soon_threadsafe(
+                            self.async_set_updated_data, self.data,
+                        )
+
+                try:
+                    await self.hass.async_add_executor_job(
+                        client.mqtt_subscribe, plan_topic, _on_plan_feedback,
+                    )
+                except Exception as err:
+                    _LOGGER.warning(
+                        "plan_feedback subscribe failed: %s", err,
+                    )
+
+                cloud_topic = f"snowbot/{device.sn}/device/cloud_points_feedback"
+
+                def _on_cloud_points(topic_str, payload, _sn=device.sn):
+                    from yarbo_robot_sdk.codec import decode_mqtt_payload
+                    try:
+                        data = decode_mqtt_payload(payload)
+                    except Exception as err:
+                        _LOGGER.warning(
+                            "cloud_points decode failed for %s: %s", _sn, err,
+                        )
+                        return
+                    if not isinstance(data, dict):
+                        return
+                    self._cloud_points[_sn] = data
+                    if self.data is not None:
+                        self.hass.loop.call_soon_threadsafe(
+                            self.async_set_updated_data, self.data,
+                        )
+
+                try:
+                    await self.hass.async_add_executor_job(
+                        client.mqtt_subscribe, cloud_topic, _on_cloud_points,
+                    )
+                except Exception as err:
+                    _LOGGER.warning(
+                        "cloud_points subscribe failed: %s", err,
+                    )
             except YarboSDKError as err:
                 _LOGGER.warning(
                     "data_feedback subscription failed for %s: %s", device.sn, err
@@ -477,6 +538,16 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
     def map_raw(self) -> dict[str, dict]:
         """Raw get_map response per device (with enable flags, names, etc)."""
         return self._map_raw
+
+    @property
+    def plan_feedback(self) -> dict[str, dict]:
+        """Latest plan_feedback payload per device (may be empty)."""
+        return self._plan_feedback
+
+    @property
+    def cloud_points(self) -> dict[str, dict]:
+        """Latest cloud_points_feedback (dynamic obstacles) per device."""
+        return self._cloud_points
 
     @property
     def map_data(self) -> dict[str, dict]:

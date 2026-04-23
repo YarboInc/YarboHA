@@ -220,11 +220,40 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         # Subscribe to data_feedback for selected devices
         for device in self.devices:
             try:
+                def _feedback_dispatch(topic_str, data, _sn=device.sn):
+                    try:
+                        if not isinstance(data, dict):
+                            return
+                        rtopic = data.get("topic")
+                        if rtopic == "save_nogozone":
+                            payload = data.get("data") or {}
+                            zid = payload.get("id")
+                            raw = self._map_raw.get(_sn) or {}
+                            for z in raw.get("nogozones") or []:
+                                if z.get("id") == zid or str(z.get("id")) == str(zid):
+                                    z["enable"] = bool(payload.get("enable", True))
+                                    break
+                            if self.data is not None:
+                                self.hass.loop.call_soon_threadsafe(
+                                    self.async_set_updated_data, self.data,
+                                )
+                        elif rtopic == "get_plan_feedback":
+                            pf = data.get("data")
+                            if isinstance(pf, dict):
+                                self._plan_feedback[_sn] = pf
+                                if self.data is not None:
+                                    self.hass.loop.call_soon_threadsafe(
+                                        self.async_set_updated_data, self.data,
+                                    )
+                    except Exception as err:
+                        _LOGGER.warning(
+                            "data_feedback dispatcher failed: %s", err,
+                        )
                 await self.hass.async_add_executor_job(
                     client.subscribe_data_feedback,
                     device.sn,
                     device.type_id,
-                    None,
+                    _feedback_dispatch,
                 )
                 plan_topic = f"snowbot/{device.sn}/device/plan_feedback"
 
@@ -297,6 +326,7 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             await self._async_fetch_device_msg(device.sn, device.type_id)
             await self._async_fetch_gps_ref(device.sn, device.type_id)
             await self._async_fetch_map_data(device.sn, device.type_id)
+            await self.async_refresh_plan_feedback(device.sn, device.type_id)
 
         # Start heartbeat check timer (every 5s)
         self._unsub_heartbeat_check = async_track_time_interval(
@@ -578,6 +608,87 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             )
         except Exception as err:
             _LOGGER.warning("Failed to fetch map data for %s: %s", sn, err)
+
+    async def async_set_nogozone_enabled(
+        self, sn: str, type_id: str, zone_id, enabled: bool
+    ) -> None:
+        """Toggle a single no-go zone's enable flag and persist it.
+
+        Mirrors the Yarbo app: forbidden while the robot is actively
+        running a plan. Re-sends the full zone payload with ``enable``
+        flipped. ``save_nogozone`` isn't in the SDK's control_topics
+        allow-list, so we encode + publish directly.
+        """
+        from homeassistant.exceptions import HomeAssistantError
+
+        if self._client is None:
+            raise HomeAssistantError("Yarbo client not initialised")
+        # Refuse while a plan is running (mirrors app UX).
+        device_data = (self.data or {}).get(sn) or {}
+        state_msg = device_data.get("StateMSG") or {}
+        planning = state_msg.get("on_going_planning", 0)
+        if isinstance(planning, (int, float)) and planning > 0 and planning != 5:
+            raise HomeAssistantError(
+                "Cannot change no-go zones while a plan is running."
+            )
+        raw = self._map_raw.get(sn) or {}
+        zone = None
+        for z in raw.get("nogozones") or []:
+            if z.get("id") == zone_id or str(z.get("id")) == str(zone_id):
+                zone = z
+                break
+        if zone is None:
+            raise HomeAssistantError(
+                f"No-go zone {zone_id} not found in cached map"
+            )
+        payload = dict(zone)
+        payload["enable"] = bool(enabled)
+        from yarbo_robot_sdk.codec import encode_mqtt_payload, should_compress
+        import json as _json
+
+        topic = f"snowbot/{sn}/app/save_nogozone"
+        fw = getattr(self._client, "_firmware_versions", {}).get(sn)
+        if should_compress(fw):
+            encoded = encode_mqtt_payload(payload)
+        else:
+            encoded = _json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        mqtt = getattr(self._client, "_mqtt", None)
+        if mqtt is None:
+            raise HomeAssistantError("MQTT broker not connected")
+        await self.hass.async_add_executor_job(mqtt.publish, topic, encoded)
+        # Optimistic local update so the UI reflects the change
+        # immediately. The get_plan_feedback round-trip will reconfirm.
+        zone["enable"] = bool(enabled)
+        if self.data is not None:
+            self.async_set_updated_data(self.data)
+
+    async def async_refresh_plan_feedback(self, sn: str, type_id: str) -> None:
+        """Ask the robot for the current plan_feedback state.
+
+        Not in the SDK's control_topics allow-list, so we publish
+        directly to snowbot/<sn>/app/get_plan_feedback.
+        """
+        if self._client is None:
+            return
+        try:
+            from yarbo_robot_sdk.codec import encode_mqtt_payload, should_compress
+            import json as _json
+
+            topic = f"snowbot/{sn}/app/get_plan_feedback"
+            fw = getattr(self._client, "_firmware_versions", {}).get(sn)
+            payload: dict = {}
+            if should_compress(fw):
+                encoded = encode_mqtt_payload(payload)
+            else:
+                encoded = _json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            mqtt = getattr(self._client, "_mqtt", None)
+            if mqtt is None:
+                return
+            await self.hass.async_add_executor_job(mqtt.publish, topic, encoded)
+        except Exception as err:
+            _LOGGER.warning(
+                "plan_feedback request failed for %s: %s", sn, err,
+            )
 
     async def async_refresh_map_data(self, sn: str, type_id: str) -> None:
         """Re-fetch map data and trigger entity update."""

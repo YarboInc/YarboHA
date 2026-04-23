@@ -48,6 +48,56 @@ HEARTBEAT_CHECK_INTERVAL = timedelta(seconds=5)
 WAKEUP_RENEWAL_INTERVAL = timedelta(minutes=4)
 
 
+
+
+def _decode_map_data(raw, sn: str):
+    """Decode get_map response's ``data`` field to a dict.
+
+    Accepts a dict (normal case) or a string — some firmware serializes
+    the response with ``data`` as a zlib-compressed binary blob that
+    Python's json reader returns as a latin-1 str. Falls back through
+    json-parse then zlib-decompress then base64+zlib.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        import json as _json
+        import zlib as _zlib
+        # 1) plain JSON string?
+        try:
+            parsed = _json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        # 2) zlib-compressed binary, bytes-as-str (latin-1)?
+        try:
+            decompressed = _zlib.decompress(raw.encode("latin-1"))
+            parsed = _json.loads(decompressed.decode("utf-8"))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        # 3) base64-wrapped zlib?
+        try:
+            import base64 as _b64
+            decompressed = _zlib.decompress(_b64.b64decode(raw))
+            parsed = _json.loads(decompressed.decode("utf-8"))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        _LOGGER.warning(
+            "Map data for %s: could not decode 'data' string (len=%d)",
+            sn, len(raw),
+        )
+    elif raw is not None:
+        _LOGGER.warning(
+            "Map data for %s: unexpected data type %s",
+            sn, type(raw).__name__,
+        )
+    return {}
+
 class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
     """Coordinate data from Yarbo SDK.
 
@@ -67,10 +117,20 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         self.devices: list = []
         self._gps_refs: dict[str, dict] = {}
         self._map_data: dict[str, dict] = {}
+        # Raw zone data (with enable flags, names, range points, etc.)
+        # as returned by get_map. Persisted so entities can expose
+        # per-zone metadata without re-fetching.
+        self._map_raw: dict[str, dict] = {}
         self._plan_data: dict[str, list[dict]] = {}
         self._last_heartbeat: dict[str, float] = {}
         self._user_standby: dict[str, bool] = {}
         self._selected_plan: dict[str, int | None] = {}
+        # Live plan state (projected path, actual_clean_area, areaIds)
+        # from the undocumented plan_feedback topic.
+        self._plan_feedback: dict[str, dict] = {}
+        # Dynamic obstacles (tmp_barrier_points) from the undocumented
+        # cloud_points_feedback topic.
+        self._cloud_points: dict[str, dict] = {}
         self._unsub_heartbeat_check: CALLBACK_TYPE | None = None
         self._unsub_wakeup_renewal: CALLBACK_TYPE | None = None
 
@@ -160,12 +220,96 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         # Subscribe to data_feedback for selected devices
         for device in self.devices:
             try:
+                def _feedback_dispatch(topic_str, data, _sn=device.sn):
+                    try:
+                        if not isinstance(data, dict):
+                            return
+                        rtopic = data.get("topic")
+                        if rtopic == "save_nogozone":
+                            payload = data.get("data") or {}
+                            zid = payload.get("id")
+                            raw = self._map_raw.get(_sn) or {}
+                            for z in raw.get("nogozones") or []:
+                                if z.get("id") == zid or str(z.get("id")) == str(zid):
+                                    z["enable"] = bool(payload.get("enable", True))
+                                    break
+                            if self.data is not None:
+                                self.hass.loop.call_soon_threadsafe(
+                                    self.async_set_updated_data, self.data,
+                                )
+                        elif rtopic == "get_plan_feedback":
+                            pf = data.get("data")
+                            if isinstance(pf, dict):
+                                self._plan_feedback[_sn] = pf
+                                if self.data is not None:
+                                    self.hass.loop.call_soon_threadsafe(
+                                        self.async_set_updated_data, self.data,
+                                    )
+                    except Exception as err:
+                        _LOGGER.warning(
+                            "data_feedback dispatcher failed: %s", err,
+                        )
                 await self.hass.async_add_executor_job(
                     client.subscribe_data_feedback,
                     device.sn,
                     device.type_id,
-                    None,
+                    _feedback_dispatch,
                 )
+                plan_topic = f"snowbot/{device.sn}/device/plan_feedback"
+
+                def _on_plan_feedback(topic_str, payload, _sn=device.sn):
+                    from yarbo_robot_sdk.codec import decode_mqtt_payload
+                    try:
+                        data = decode_mqtt_payload(payload)
+                    except Exception as err:
+                        _LOGGER.warning(
+                            "plan_feedback decode failed for %s: %s", _sn, err,
+                        )
+                        return
+                    if not isinstance(data, dict):
+                        return
+                    self._plan_feedback[_sn] = data
+                    if self.data is not None:
+                        self.hass.loop.call_soon_threadsafe(
+                            self.async_set_updated_data, self.data,
+                        )
+
+                try:
+                    await self.hass.async_add_executor_job(
+                        client.mqtt_subscribe, plan_topic, _on_plan_feedback,
+                    )
+                except Exception as err:
+                    _LOGGER.warning(
+                        "plan_feedback subscribe failed: %s", err,
+                    )
+
+                cloud_topic = f"snowbot/{device.sn}/device/cloud_points_feedback"
+
+                def _on_cloud_points(topic_str, payload, _sn=device.sn):
+                    from yarbo_robot_sdk.codec import decode_mqtt_payload
+                    try:
+                        data = decode_mqtt_payload(payload)
+                    except Exception as err:
+                        _LOGGER.warning(
+                            "cloud_points decode failed for %s: %s", _sn, err,
+                        )
+                        return
+                    if not isinstance(data, dict):
+                        return
+                    self._cloud_points[_sn] = data
+                    if self.data is not None:
+                        self.hass.loop.call_soon_threadsafe(
+                            self.async_set_updated_data, self.data,
+                        )
+
+                try:
+                    await self.hass.async_add_executor_job(
+                        client.mqtt_subscribe, cloud_topic, _on_cloud_points,
+                    )
+                except Exception as err:
+                    _LOGGER.warning(
+                        "cloud_points subscribe failed: %s", err,
+                    )
             except YarboSDKError as err:
                 _LOGGER.warning(
                     "data_feedback subscription failed for %s: %s", device.sn, err
@@ -182,6 +326,7 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             await self._async_fetch_device_msg(device.sn, device.type_id)
             await self._async_fetch_gps_ref(device.sn, device.type_id)
             await self._async_fetch_map_data(device.sn, device.type_id)
+            await self.async_refresh_plan_feedback(device.sn, device.type_id)
 
         # Start heartbeat check timer (every 5s)
         self._unsub_heartbeat_check = async_track_time_interval(
@@ -420,6 +565,21 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
     # ---- Map data ----
 
     @property
+    def map_raw(self) -> dict[str, dict]:
+        """Raw get_map response per device (with enable flags, names, etc)."""
+        return self._map_raw
+
+    @property
+    def plan_feedback(self) -> dict[str, dict]:
+        """Latest plan_feedback payload per device (may be empty)."""
+        return self._plan_feedback
+
+    @property
+    def cloud_points(self) -> dict[str, dict]:
+        """Latest cloud_points_feedback (dynamic obstacles) per device."""
+        return self._cloud_points
+
+    @property
     def map_data(self) -> dict[str, dict]:
         """Map zone data per device: {sn: GeoJSON FeatureCollection}."""
         return self._map_data
@@ -432,11 +592,12 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             result = await self.hass.async_add_executor_job(
                 self._client.get_map, sn, type_id
             )
-            raw_data = result.get("data", {})
+            raw_data = _decode_map_data(result.get("data", {}), sn)
             from yarbo_robot_sdk.device_helpers import convert_map_to_geojson
             fallback_ref = self._gps_refs.get(sn)
             geojson = convert_map_to_geojson(raw_data, fallback_ref)
             self._map_data[sn] = geojson
+            self._map_raw[sn] = raw_data
             feature_count = len(geojson.get("features", []))
             _LOGGER.info("Map data for %s: %d features loaded", sn, feature_count)
         except TimeoutError:
@@ -447,6 +608,87 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             )
         except Exception as err:
             _LOGGER.warning("Failed to fetch map data for %s: %s", sn, err)
+
+    async def async_set_nogozone_enabled(
+        self, sn: str, type_id: str, zone_id, enabled: bool
+    ) -> None:
+        """Toggle a single no-go zone's enable flag and persist it.
+
+        Mirrors the Yarbo app: forbidden while the robot is actively
+        running a plan. Re-sends the full zone payload with ``enable``
+        flipped. ``save_nogozone`` isn't in the SDK's control_topics
+        allow-list, so we encode + publish directly.
+        """
+        from homeassistant.exceptions import HomeAssistantError
+
+        if self._client is None:
+            raise HomeAssistantError("Yarbo client not initialised")
+        # Refuse while a plan is running (mirrors app UX).
+        device_data = (self.data or {}).get(sn) or {}
+        state_msg = device_data.get("StateMSG") or {}
+        planning = state_msg.get("on_going_planning", 0)
+        if isinstance(planning, (int, float)) and planning > 0 and planning != 5:
+            raise HomeAssistantError(
+                "Cannot change no-go zones while a plan is running."
+            )
+        raw = self._map_raw.get(sn) or {}
+        zone = None
+        for z in raw.get("nogozones") or []:
+            if z.get("id") == zone_id or str(z.get("id")) == str(zone_id):
+                zone = z
+                break
+        if zone is None:
+            raise HomeAssistantError(
+                f"No-go zone {zone_id} not found in cached map"
+            )
+        payload = dict(zone)
+        payload["enable"] = bool(enabled)
+        from yarbo_robot_sdk.codec import encode_mqtt_payload, should_compress
+        import json as _json
+
+        topic = f"snowbot/{sn}/app/save_nogozone"
+        fw = getattr(self._client, "_firmware_versions", {}).get(sn)
+        if should_compress(fw):
+            encoded = encode_mqtt_payload(payload)
+        else:
+            encoded = _json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        mqtt = getattr(self._client, "_mqtt", None)
+        if mqtt is None:
+            raise HomeAssistantError("MQTT broker not connected")
+        await self.hass.async_add_executor_job(mqtt.publish, topic, encoded)
+        # Optimistic local update so the UI reflects the change
+        # immediately. The get_plan_feedback round-trip will reconfirm.
+        zone["enable"] = bool(enabled)
+        if self.data is not None:
+            self.async_set_updated_data(self.data)
+
+    async def async_refresh_plan_feedback(self, sn: str, type_id: str) -> None:
+        """Ask the robot for the current plan_feedback state.
+
+        Not in the SDK's control_topics allow-list, so we publish
+        directly to snowbot/<sn>/app/get_plan_feedback.
+        """
+        if self._client is None:
+            return
+        try:
+            from yarbo_robot_sdk.codec import encode_mqtt_payload, should_compress
+            import json as _json
+
+            topic = f"snowbot/{sn}/app/get_plan_feedback"
+            fw = getattr(self._client, "_firmware_versions", {}).get(sn)
+            payload: dict = {}
+            if should_compress(fw):
+                encoded = encode_mqtt_payload(payload)
+            else:
+                encoded = _json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            mqtt = getattr(self._client, "_mqtt", None)
+            if mqtt is None:
+                return
+            await self.hass.async_add_executor_job(mqtt.publish, topic, encoded)
+        except Exception as err:
+            _LOGGER.warning(
+                "plan_feedback request failed for %s: %s", sn, err,
+            )
 
     async def async_refresh_map_data(self, sn: str, type_id: str) -> None:
         """Re-fetch map data and trigger entity update."""

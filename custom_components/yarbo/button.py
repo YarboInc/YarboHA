@@ -202,12 +202,10 @@ class YarboStartPlanButton(
                 "Cannot start plan: device is wired charging"
             )
 
-        # Check 4: Not wireless charging (BatteryMSG.status > 1 means charging)
-        battery_status = (data.get("BatteryMSG") or {}).get("status")
-        if isinstance(battery_status, (int, float)) and battery_status > 1:
-            raise HomeAssistantError(
-                "Cannot start plan: device is charging"
-            )
+        # Wireless charging is NOT a blocker: the robot undocks itself
+        # when a plan is issued (matches the Yarbo app's behaviour). We
+        # only refuse wired charging (check 3) because a physical cable
+        # genuinely prevents the robot from moving.
 
         # Check 5: RTK signal must not be weak (4=Strong, 5=Medium)
         rtk_status = (data.get("RTKMSG") or {}).get("status")

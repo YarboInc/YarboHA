@@ -74,6 +74,64 @@ class YarboOnlineBinarySensor(
             return self.coordinator.data[self._device.sn].get("__online__")
         return None
 
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Surface DeviceMSG fields that don't have dedicated entities.
+
+        Wheel speed, fused odometry confidence, ultrasonic distances,
+        impact & rain sensors, and abnormal_msg — all keyed directly
+        off the raw DeviceMSG snapshot. Small scalars only; piggy-
+        backing on the always-present 'online' sensor keeps the
+        entity surface tidy.
+        """
+        data = (self.coordinator.data or {}).get(self._device.sn, {}) or {}
+        attrs: dict = {}
+
+        ws = data.get("WheelSpeedMSG")
+        if isinstance(ws, dict):
+            left = ws.get("left")
+            right = ws.get("right")
+            if isinstance(left, (int, float)):
+                attrs["wheel_speed_left_mps"] = round(float(left), 3)
+            if isinstance(right, (int, float)):
+                attrs["wheel_speed_right_mps"] = round(float(right), 3)
+            if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                attrs["speed_mps"] = round((float(left) + float(right)) / 2.0, 3)
+            for k in ("dist_left", "dist_right"):
+                v = ws.get(k)
+                if isinstance(v, (int, float)):
+                    attrs[k + "_m"] = round(float(v), 1)
+
+        conf = data.get("combined_odom_confidence")
+        if isinstance(conf, (int, float)):
+            attrs["odom_confidence"] = round(float(conf), 3)
+
+        rs = data.get("RunningStatusMSG")
+        if isinstance(rs, dict):
+            for k in (
+                "impact_sensor",
+                "rain_sensor_data",
+                "head_gyro_pitch",
+                "head_gyro_roll",
+                "chute_angle",
+            ):
+                v = rs.get(k)
+                if v is not None:
+                    attrs[k] = v
+
+        um = data.get("ultrasonic_msg")
+        if isinstance(um, dict):
+            for k in ("lf_dis", "mt_dis", "rf_dis"):
+                v = um.get(k)
+                if v is not None:
+                    attrs[k] = v
+
+        ab = data.get("abnormal_msg")
+        if ab is not None:
+            attrs["abnormal_msg"] = ab
+
+        return attrs
+
 
 class YarboConfigBinarySensor(
     CoordinatorEntity[YarboDataUpdateCoordinator], BinarySensorEntity

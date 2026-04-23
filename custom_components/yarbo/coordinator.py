@@ -48,6 +48,56 @@ HEARTBEAT_CHECK_INTERVAL = timedelta(seconds=5)
 WAKEUP_RENEWAL_INTERVAL = timedelta(minutes=4)
 
 
+
+
+def _decode_map_data(raw, sn: str):
+    """Decode get_map response's ``data`` field to a dict.
+
+    Accepts a dict (normal case) or a string — some firmware serializes
+    the response with ``data`` as a zlib-compressed binary blob that
+    Python's json reader returns as a latin-1 str. Falls back through
+    json-parse then zlib-decompress then base64+zlib.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        import json as _json
+        import zlib as _zlib
+        # 1) plain JSON string?
+        try:
+            parsed = _json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        # 2) zlib-compressed binary, bytes-as-str (latin-1)?
+        try:
+            decompressed = _zlib.decompress(raw.encode("latin-1"))
+            parsed = _json.loads(decompressed.decode("utf-8"))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        # 3) base64-wrapped zlib?
+        try:
+            import base64 as _b64
+            decompressed = _zlib.decompress(_b64.b64decode(raw))
+            parsed = _json.loads(decompressed.decode("utf-8"))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        _LOGGER.warning(
+            "Map data for %s: could not decode 'data' string (len=%d)",
+            sn, len(raw),
+        )
+    elif raw is not None:
+        _LOGGER.warning(
+            "Map data for %s: unexpected data type %s",
+            sn, type(raw).__name__,
+        )
+    return {}
+
 class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
     """Coordinate data from Yarbo SDK.
 
@@ -432,7 +482,7 @@ class YarboDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             result = await self.hass.async_add_executor_job(
                 self._client.get_map, sn, type_id
             )
-            raw_data = result.get("data", {})
+            raw_data = _decode_map_data(result.get("data", {}), sn)
             from yarbo_robot_sdk.device_helpers import convert_map_to_geojson
             fallback_ref = self._gps_refs.get(sn)
             geojson = convert_map_to_geojson(raw_data, fallback_ref)

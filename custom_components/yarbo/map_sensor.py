@@ -92,5 +92,73 @@ class YarboMapSensor(
             attrs["latitude"] = ref["latitude"]
             attrs["longitude"] = ref["longitude"]
 
+        # Per-zone no-go metadata (id / name / enable) so consumers
+        # can expose a toggle UI. Lightweight — the heavy 'range' and
+        # 'ref' fields stay hidden behind map_raw.
+        raw_map = getattr(self.coordinator, "map_raw", {}).get(
+            self._device.sn
+        ) or {}
+        nogo_list = [
+            {
+                "id": z.get("id"),
+                "name": z.get("name"),
+                "enable": bool(z.get("enable", True)),
+            }
+            for z in raw_map.get("nogozones") or []
+        ]
+        if nogo_list:
+            attrs["nogo_zones"] = nogo_list
+
+        # Dynamic obstacles from cloud_points_feedback, GPS-projected.
+        cp = getattr(self.coordinator, "cloud_points", {}).get(
+            self._device.sn
+        ) or {}
+        barriers = cp.get("tmp_barrier_points") or []
+        ref_lat = ref.get("latitude") if ref else None
+        ref_lon = ref.get("longitude") if ref else None
+        if barriers and ref_lat is not None and ref_lon is not None:
+            try:
+                from yarbo_robot_sdk.device_helpers import convert_local_to_gps
+                features = []
+                for i, cluster in enumerate(barriers):
+                    if not isinstance(cluster, list) or not cluster:
+                        continue
+                    coords = []
+                    for pt in cluster:
+                        try:
+                            lat, lon = convert_local_to_gps(
+                                ref_lat,
+                                ref_lon,
+                                float(pt.get("x", 0)),
+                                float(pt.get("y", 0)),
+                            )
+                            coords.append(
+                                [round(lon, 7), round(lat, 7)]
+                            )
+                        except Exception:
+                            pass
+                    if not coords:
+                        continue
+                    geom = (
+                        {"type": "Point", "coordinates": coords[0]}
+                        if len(coords) == 1
+                        else {"type": "MultiPoint", "coordinates": coords}
+                    )
+                    features.append({
+                        "type": "Feature",
+                        "geometry": geom,
+                        "properties": {"obstacle_index": i},
+                    })
+                if features:
+                    attrs["obstacles_geojson"] = {
+                        "type": "FeatureCollection",
+                        "features": features,
+                    }
+                    attrs["obstacle_count"] = len(features)
+            except Exception as err:
+                _LOGGER.warning(
+                    "obstacles_geojson build failed: %s", err,
+                )
+
         return attrs
 

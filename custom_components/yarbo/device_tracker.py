@@ -48,6 +48,28 @@ class YarboDeviceTracker(
         self._attr_unique_id = f"{device.sn}_device_tracker"
         self._computed_lat: float | None = None
         self._computed_lon: float | None = None
+        # Suppress no-op state writes. MQTT pushes heartbeats every ~5s, and
+        # without this cache, _handle_coordinator_update writes a duplicate
+        # state row each heartbeat even when the mower is parked. With this
+        # guard, the recorder only records actual position/availability
+        # changes. See PR upstream at YarboInc/YarboHA.
+        self._last_written_lat: float | None = None
+        self._last_written_lon: float | None = None
+        self._last_written_available: bool | None = None
+
+    def _maybe_write_state(self) -> None:
+        """Write state to HA only when position or availability actually changed."""
+        current_available = self.available
+        if (
+            self._computed_lat == self._last_written_lat
+            and self._computed_lon == self._last_written_lon
+            and current_available == self._last_written_available
+        ):
+            return
+        self._last_written_lat = self._computed_lat
+        self._last_written_lon = self._computed_lon
+        self._last_written_available = current_available
+        self.async_write_ha_state()
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -100,20 +122,25 @@ class YarboDeviceTracker(
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Recompute GPS position from CombinedOdom + GPS reference."""
+        """Recompute GPS position from CombinedOdom + GPS reference.
+
+        State writes are gated through _maybe_write_state to skip no-op
+        updates (which heartbeat-driven MQTT pushes would otherwise produce
+        every ~5s, even when the mower has not moved).
+        """
         self._computed_lat = None
         self._computed_lon = None
 
         gps_ref = self.coordinator.gps_refs.get(self._device.sn)
         if gps_ref is None or gps_ref.get("rtkFixType") != 1:
-            self.async_write_ha_state()
+            self._maybe_write_state()
             return
 
         ref = gps_ref.get("ref", {})
         ref_lat = ref.get("latitude")
         ref_lon = ref.get("longitude")
         if ref_lat is None or ref_lon is None:
-            self.async_write_ha_state()
+            self._maybe_write_state()
             return
 
         device_data = (self.coordinator.data or {}).get(self._device.sn, {})
@@ -122,7 +149,7 @@ class YarboDeviceTracker(
         local_x = extract_field(device_data, "CombinedOdom.x")
         local_y = extract_field(device_data, "CombinedOdom.y")
         if local_x is None or local_y is None:
-            self.async_write_ha_state()
+            self._maybe_write_state()
             return
 
         try:
@@ -132,4 +159,4 @@ class YarboDeviceTracker(
         except (ValueError, TypeError) as err:
             _LOGGER.debug("Coordinate conversion failed for %s: %s", self._device.sn, err)
 
-        self.async_write_ha_state()
+        self._maybe_write_state()
